@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+node_modules/
+.next/
+*.pyc
+.env
+.idea/
+.DS_Store
+dist/
+.coverage
+*.db
+skill-extract/

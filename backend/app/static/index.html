@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>音声言語デモ</title>
+  <style>
+    :root { font-family: "Segoe UI", "Hiragino Sans", sans-serif; color: #1b1f24; background: #f4f1ea; }
+    body { max-width: 880px; margin: 32px auto; padding: 0 16px 48px; }
+    h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+    .note { background: #fff4d6; border: 1px solid #e6c35c; padding: 10px 12px; border-radius: 8px; }
+    section { background: #fff; border-radius: 12px; padding: 16px; margin: 16px 0; box-shadow: 0 1px 4px #0001; }
+    button, input[type=file] { margin: 4px 8px 4px 0; }
+    button { background: #1f4b3a; color: #fff; border: 0; border-radius: 8px; padding: 8px 14px; cursor: pointer; }
+    button:disabled { background: #99a; cursor: not-allowed; }
+    button.secondary { background: #445; }
+    pre, .reply, .bubble { white-space: pre-wrap; background: #f7f7f5; padding: 10px; border-radius: 8px; }
+    .bubble.user { border-left: 4px solid #1f4b3a; }
+    .bubble.assistant { border-left: 4px solid #445; }
+    li { margin: 8px 0; }
+    .meta { color: #556; font-size: 0.85rem; }
+    #thread { display: grid; gap: 10px; }
+  </style>
+</head>
+<body>
+  <h1>音声言語デモ</h1>
+  <p>録音中は断片を送ります。ファイルからも「会話する」で同じ往復ができます。</p>
+  <p class="note">初期状態はモックです。実音声認識も、音声言語基盤モデルも動きません。音声データは学習に使いません。</p>
+
+  <section>
+    <h2>1. 会話</h2>
+    <p class="meta" id="session-label">会話はまだ始まっていません</p>
+    <p>
+      <button id="rec" type="button">録音する</button>
+      <button id="stop" type="button" disabled>停止して会話</button>
+      <button id="new-chat" type="button" class="secondary">新しい会話</button>
+      <input id="file" aria-label="音声ファイル" type="file" accept="audio/*" />
+      <button id="turn" type="button">会話する</button>
+      <button id="stream" type="button" class="secondary">途中経過だけ見る</button>
+    </p>
+    <p class="meta" id="file-label">ファイル未選択</p>
+    <p class="meta" id="stream-status">WebSocket: 未接続</p>
+    <div id="thread"></div>
+    <h3>会話一覧</h3>
+    <ul id="chats"></ul>
+  </section>
+
+  <section>
+    <h2>2. 履歴</h2>
+    <p>
+      <button id="reload" type="button" class="secondary">再読込</button>
+      <button id="prune" type="button" class="secondary">期限切れを削除</button>
+    </p>
+    <ul id="history"></ul>
+  </section>
+
+  <section>
+    <h2>接続</h2>
+    <pre id="health">確認中…</pre>
+  </section>
+
+  <script>
+    const api = "";
+    let blob = null;
+    let recorder = null;
+    let chunks = [];
+    let liveWs = null;
+    let conversationId = Number(localStorage.getItem("conversation_id") || "") || null;
+
+    const $ = (id) => document.getElementById(id);
+
+    function setSessionLabel() {
+      $("session-label").textContent = conversationId
+        ? `会話 ID: ${conversationId}`
+        : "会話はまだ始まっていません";
+    }
+
+    function setFile(file) {
+      blob = file;
+      $("file-label").textContent = file ? `${file.name} (${file.type || "unknown"}, ${file.size} bytes)` : "ファイル未選択";
+    }
+
+    function renderThread(messages) {
+      $("thread").innerHTML = messages.length ? "" : '<p class="meta">まだ発話がありません</p>';
+      for (const msg of messages) {
+        const div = document.createElement("div");
+        div.className = `bubble ${msg.role}`;
+        div.textContent = `${msg.role === "user" ? "あなた" : "応答"}: ${msg.content}`;
+        $("thread").appendChild(div);
+      }
+    }
+
+    async function loadThread() {
+      if (!conversationId) { renderThread([]); return; }
+      const r = await fetch(`${api}/api/conversations/${conversationId}`);
+      if (!r.ok) { conversationId = null; localStorage.removeItem("conversation_id"); setSessionLabel(); renderThread([]); return; }
+      const data = await r.json();
+      renderThread(data.messages || []);
+    }
+
+    $("file").addEventListener("change", (e) => setFile(e.target.files[0] || null));
+
+    $("rec").addEventListener("click", async () => {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      chunks = [];
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      liveWs = new WebSocket(`${proto}://${location.host}/ws/live`);
+      liveWs.binaryType = "arraybuffer";
+      recorder = new MediaRecorder(stream);
+      recorder.ondataavailable = (e) => {
+        if (e.data.size) chunks.push(e.data);
+        if (e.data.size && liveWs?.readyState === 1) e.data.arrayBuffer().then((buf) => liveWs.send(buf));
+      };
+      recorder.onstop = () => {
+        stream.getTracks().forEach((t) => t.stop());
+        setFile(new File(chunks, "recording.webm", { type: recorder.mimeType || "audio/webm" }));
+        if (liveWs?.readyState === 1) liveWs.send(JSON.stringify({ type: "end" }));
+      };
+      liveWs.onopen = () => {
+        liveWs.send(JSON.stringify({
+          type: "start",
+          filename: "live.webm",
+          content_type: recorder.mimeType || "audio/webm",
+          conversation_id: conversationId,
+          complete_turn: true,
+        }));
+        recorder.start(400);
+        $("stream-status").textContent = "WebSocket: 録音中";
+      };
+      liveWs.onmessage = async (ev) => {
+        const data = JSON.parse(ev.data);
+        if (data.type === "chunk_ack") $("stream-status").textContent = data.transcript;
+        if (data.type === "partial") $("stream-status").textContent = `途中: ${data.transcript}`;
+        if (data.type === "final") $("stream-status").textContent = `確定: ${data.transcript}`;
+        if (data.type === "error") $("stream-status").textContent = `エラー: ${data.detail}`;
+        if (data.type === "reply") {
+          conversationId = data.conversation_id;
+          localStorage.setItem("conversation_id", String(conversationId));
+          setSessionLabel();
+          await loadThread();
+          await loadHistory();
+          await loadChats();
+          const spoken = await fetch(`${api}/api/speak`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: data.reply }),
+          });
+          if (spoken.ok) new Audio(URL.createObjectURL(await spoken.blob())).play();
+        }
+      };
+      $("rec").disabled = true;
+      $("stop").disabled = false;
+    });
+
+    $("stop").addEventListener("click", () => {
+      recorder?.stop();
+      $("rec").disabled = false;
+      $("stop").disabled = true;
+    });
+
+    $("new-chat").addEventListener("click", async () => {
+      const r = await fetch(`${api}/api/conversations`, { method: "POST" });
+      const data = await r.json();
+      conversationId = data.conversation_id;
+      localStorage.setItem("conversation_id", String(conversationId));
+      setSessionLabel();
+      renderThread([]);
+      await loadChats();
+    });
+
+    $("turn").addEventListener("click", async () => {
+      if (!blob) { renderThread([{ role: "assistant", content: "先に録音するか、ファイルを選んでください。" }]); return; }
+      const form = new FormData();
+      form.append("file", blob, blob.name || "audio.webm");
+      if (conversationId) form.append("conversation_id", String(conversationId));
+      const r = await fetch(`${api}/api/turn`, { method: "POST", body: form });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) { renderThread([{ role: "assistant", content: `エラー: ${data.detail || r.status}` }]); return; }
+      conversationId = data.conversation_id;
+      localStorage.setItem("conversation_id", String(conversationId));
+      setSessionLabel();
+      await loadThread();
+      await loadHistory();
+      await loadChats();
+      const spoken = await fetch(`${api}/api/speak`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: data.reply }),
+      });
+      if (spoken.ok) new Audio(URL.createObjectURL(await spoken.blob())).play();
+    });
+
+    $("stream").addEventListener("click", async () => {
+      if (!blob) { $("stream-status").textContent = "先に音声を選んでください"; return; }
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${proto}://${location.host}/ws/transcribe`);
+      $("stream-status").textContent = "WebSocket: 接続中";
+      ws.binaryType = "arraybuffer";
+      ws.onopen = async () => {
+        ws.send(JSON.stringify({ filename: blob.name || "audio.webm", content_type: blob.type || "audio/webm" }));
+        ws.send(await blob.arrayBuffer());
+      };
+      ws.onmessage = (ev) => {
+        const data = JSON.parse(ev.data);
+        if (data.type === "partial") $("stream-status").textContent = `途中: ${data.transcript}`;
+        if (data.type === "final") $("stream-status").textContent = `確定: ${data.transcript}`;
+        if (data.type === "error") $("stream-status").textContent = `エラー: ${data.detail}`;
+      };
+      ws.onerror = () => { $("stream-status").textContent = "WebSocket: 失敗"; };
+    });
+
+    async function loadHistory() {
+      const rows = await (await fetch(`${api}/api/transcripts`)).json();
+      $("history").innerHTML = rows.length ? "" : "<li>履歴はまだありません</li>";
+      for (const row of rows) {
+        const li = document.createElement("li");
+        li.innerHTML = `<div>${row.content}</div><div class="meta">#${row.id} / ${row.provider} / ${row.created_at}</div>`;
+        const btn = document.createElement("button");
+        btn.className = "secondary";
+        btn.textContent = "削除";
+        btn.onclick = async () => {
+          await fetch(`${api}/api/transcripts/${row.id}`, { method: "DELETE" });
+          await loadHistory();
+        };
+        li.appendChild(btn);
+        $("history").appendChild(li);
+      }
+    }
+
+    async function loadChats() {
+      const rows = await (await fetch(`${api}/api/conversations`)).json();
+      $("chats").innerHTML = rows.length ? "" : "<li>会話はまだありません</li>";
+      for (const row of rows) {
+        const li = document.createElement("li");
+        li.innerHTML = `<span class="meta">#${row.id} / ${row.messages}件 / ${row.created_at}</span> `;
+        const open = document.createElement("button");
+        open.className = "secondary";
+        open.textContent = "開く";
+        open.onclick = async () => {
+          conversationId = row.id;
+          localStorage.setItem("conversation_id", String(row.id));
+          setSessionLabel();
+          await loadThread();
+        };
+        const del = document.createElement("button");
+        del.className = "secondary";
+        del.textContent = "削除";
+        del.onclick = async () => {
+          await fetch(`${api}/api/conversations/${row.id}`, { method: "DELETE" });
+          if (conversationId === row.id) {
+            conversationId = null;
+            localStorage.removeItem("conversation_id");
+            setSessionLabel();
+            renderThread([]);
+          }
+          await loadChats();
+        };
+        li.appendChild(open);
+        li.appendChild(del);
+        $("chats").appendChild(li);
+      }
+    }
+
+    $("reload").addEventListener("click", loadHistory);
+    $("prune").addEventListener("click", async () => {
+      await fetch(`${api}/api/transcripts`, { method: "DELETE" });
+      await loadHistory();
+    });
+
+    fetch(`${api}/health`).then(async (r) => {
+      $("health").textContent = JSON.stringify(await r.json(), null, 2);
+    }).catch((e) => { $("health").textContent = String(e); });
+
+    setSessionLabel();
+    loadThread();
+    loadHistory();
+    loadChats();
+  </script>
+</body>
+</html>
